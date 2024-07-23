@@ -229,100 +229,113 @@ interface IWETH {
 }
 
 
-contract FarmingContract  {
-    IERC20 public lpToken;
-    IERC20 public rewardToken;
-    IERC20 public stakingToken; // Token to be staked (e.g., an ERC20 token)
-
-    ISherpaswapV2Router02 public uniswapRouter;
-    address public uniswapPair;
-
-    uint256 public rewardRate; // e.g., rewards per block
-    uint256 public lastUpdateBlock;
-    uint256 public rewardPerTokenStored;
-
-    mapping(address => uint256) public userRewards;
-    mapping(address => uint256) public userStaked;
-    mapping(address => uint256) public userRewardPerTokenPaid;
-
-    uint256 public totalStaked;
-
-    constructor(
-        address _lpToken,
-        address _rewardToken,
-        address _stakingToken,
-        address _uniswapRouter,
-        uint256 _rewardRate
-        ) public {
-        lpToken = IERC20(_lpToken);
-        rewardToken = IERC20(_rewardToken);
-        stakingToken = IERC20(_stakingToken);
-        uniswapRouter = ISherpaswapV2Router02(_uniswapRouter);
-        rewardRate = _rewardRate;
-        lastUpdateBlock = block.number;
-
-        // Create the Uniswap pair if it doesn't exist
-        address _factory = uniswapRouter.factory();
-        uniswapPair = ISherpaswapV2Factory(_factory).createPair(address(stakingToken), address(rewardToken));
+contract FarmingContract {
+    struct PoolInfo {
+        IERC20 lpToken;           // Address of LP token contract.
+        uint256 rewardRate;       // Reward rate for the pool.
+        uint256 lastUpdateBlock;  // Last block number that reward distribution occurs.
+        uint256 rewardPerTokenStored; // Accumulated reward per token.
+        uint256 totalStaked;      // Total staked amount.
     }
 
-    modifier updateReward(address account) {
-        rewardPerTokenStored = rewardPerToken();
-        lastUpdateBlock = block.number;
+    struct UserInfo {
+        uint256 amount;           // How many LP tokens the user has provided.
+        uint256 rewardDebt;       // Reward debt.
+    }
+
+    ISherpaswapV2Router02 public sherpaswaprouter;
+    address public rewardToken;
+    mapping(uint256 => PoolInfo) public poolInfo;
+    mapping(uint256 => mapping(address => UserInfo)) public userInfo;
+    uint256 public poolCount;
+
+    event Deposit(address indexed user, uint256 indexed pid, uint256 amount);
+    event Withdraw(address indexed user, uint256 indexed pid, uint256 amount);
+    event RewardPaid(address indexed user, uint256 indexed pid, uint256 reward);
+
+    constructor(address _sherpaswaprouter, address _rewardToken) public {
+        sherpaswaprouter = ISherpaswapV2Router02(_sherpaswaprouter);
+        rewardToken = _rewardToken;
+    }
+
+    function addPool(address _lpToken, uint256 _rewardRate) external {
+        poolInfo[poolCount] = PoolInfo({
+            lpToken: IERC20(_lpToken),
+            rewardRate: _rewardRate,
+            lastUpdateBlock: block.number,
+            rewardPerTokenStored: 0,
+            totalStaked: 0
+        });
+        poolCount++;
+    }
+
+    function rewardPerToken(uint256 _pid) public view returns (uint256) {
+        PoolInfo storage pool = poolInfo[_pid];
+        if (pool.totalStaked == 0) {
+            return pool.rewardPerTokenStored;
+        }
+        return pool.rewardPerTokenStored + ((block.number - pool.lastUpdateBlock) * pool.rewardRate * 1e18) / pool.totalStaked;
+    }
+
+    function earned(uint256 _pid, address account) public view returns (uint256) {
+        UserInfo storage user = userInfo[_pid][account];
+        return (user.amount * (rewardPerToken(_pid) - user.rewardDebt)) / 1e18;
+    }
+
+    function updateReward(uint256 _pid, address account) internal {
+        PoolInfo storage pool = poolInfo[_pid];
+        pool.rewardPerTokenStored = rewardPerToken(_pid);
+        pool.lastUpdateBlock = block.number;
         if (account != address(0)) {
-            userRewards[account] = earned(account);
-            userRewardPerTokenPaid[account] = rewardPerTokenStored;
+            
+            UserInfo storage user = userInfo[_pid][account];
+            user.rewardDebt = rewardPerToken(_pid);
         }
-        _;
     }
 
-    function rewardPerToken() public view returns (uint256) {
-        if (totalStaked == 0) {
-            return rewardPerTokenStored;
-        }
-        return
-            rewardPerTokenStored +
-            ((block.number - lastUpdateBlock) * rewardRate * 1e18) /
-            totalStaked;
+    function stake(uint256 _pid, uint256 amount) external {
+        PoolInfo storage pool = poolInfo[_pid];
+        UserInfo storage user = userInfo[_pid][msg.sender];
+        updateReward(_pid, msg.sender);
+        pool.totalStaked += amount;
+        user.amount += amount;
+        pool.lpToken.transferFrom(msg.sender, address(this), amount);
+        emit Deposit(msg.sender, _pid, amount);
     }
 
-    function earned(address account) public view returns (uint256) {
-        return
-            (userStaked[account] * (rewardPerToken() - userRewardPerTokenPaid[account])) /
-            1e18 +
-            userRewards[account];
+    function withdraw(uint256 _pid, uint256 amount) external {
+        PoolInfo storage pool = poolInfo[_pid];
+        UserInfo storage user = userInfo[_pid][msg.sender];
+        require(user.amount >= amount, "withdraw: not good");
+        updateReward(_pid, msg.sender);
+        pool.totalStaked -= amount;
+        user.amount -= amount;
+        pool.lpToken.transfer(msg.sender, amount);
+        emit Withdraw(msg.sender, _pid, amount);
     }
 
-    function stake(uint256 amount) external updateReward(msg.sender) {
-        totalStaked += amount;
-        userStaked[msg.sender] += amount;
-        lpToken.transferFrom(msg.sender, address(this), amount);
-    }
-
-    function withdraw(uint256 amount) external updateReward(msg.sender) {
-        totalStaked -= amount;
-        userStaked[msg.sender] -= amount;
-        lpToken.transfer(msg.sender, amount);
-    }
-
-    function claimReward() external updateReward(msg.sender) {
-        uint256 reward = userRewards[msg.sender];
+    function claimReward(uint256 _pid) external {
+        updateReward(_pid, msg.sender);
+        UserInfo storage user = userInfo[_pid][msg.sender];
+        uint256 reward = earned(_pid, msg.sender);
         if (reward > 0) {
-            userRewards[msg.sender] = 0;
-            rewardToken.transfer(msg.sender, reward);
+            user.rewardDebt = rewardPerToken(_pid);
+            IERC20(rewardToken).transfer(msg.sender, reward);
+            emit RewardPaid(msg.sender, _pid, reward);
         }
     }
 
-    function addLiquidity(uint256 tokenAmount, uint256 rewardTokenAmount) external {
-        stakingToken.transferFrom(msg.sender, address(this), tokenAmount);
-        rewardToken.transferFrom(msg.sender, address(this), rewardTokenAmount);
+    function addLiquidity(uint256 _pid, uint256 tokenAmount, uint256 rewardTokenAmount) external {
+        PoolInfo storage pool = poolInfo[_pid];
+        pool.lpToken.transferFrom(msg.sender, address(this), tokenAmount);
+        IERC20(rewardToken).transferFrom(msg.sender, address(this), rewardTokenAmount);
 
-        stakingToken.approve(address(uniswapRouter), tokenAmount);
-        rewardToken.approve(address(uniswapRouter), rewardTokenAmount);
+        pool.lpToken.approve(address(sherpaswaprouter), tokenAmount);
+        IERC20(rewardToken).approve(address(sherpaswaprouter), rewardTokenAmount);
 
-        uniswapRouter.addLiquidity(
-            address(stakingToken),
-            address(rewardToken),
+        sherpaswaprouter.addLiquidity(
+            address(pool.lpToken),
+            rewardToken,
             tokenAmount,
             rewardTokenAmount,
             0,
@@ -332,13 +345,17 @@ contract FarmingContract  {
         );
     }
 
-    function removeLiquidity(uint256 liquidity) external {
-        IERC20(uniswapPair).transferFrom(msg.sender, address(this), liquidity);
-        IERC20(uniswapPair).approve(address(uniswapRouter), liquidity);
+    function removeLiquidity(uint256 _pid, uint256 liquidity) external {
+        PoolInfo storage pool = poolInfo[_pid];
+        // Transfer LP tokens from the user to the contract
+        pool.lpToken.transferFrom(msg.sender, address(this), liquidity);
+        // Approve the Sherpaswap router to spend the LP tokens
+        pool.lpToken.approve(address(sherpaswaprouter), liquidity);
 
-        uniswapRouter.removeLiquidity(
-            address(stakingToken),
-            address(rewardToken),
+        // Remove liquidity using the Sherpaswap router
+        sherpaswaprouter.removeLiquidity(
+            address(pool.lpToken),
+            rewardToken,
             liquidity,
             0,
             0,
