@@ -7,3 +7,5 @@ reward
 0x089FE5D7799093aE1339C8fA6756adeebbDcb92f
 router
 0x63d530FDb0A8986E444cCd2f457Df02646D7D6e2
+
+In present, added addliquidity and removeliquidity logic.
